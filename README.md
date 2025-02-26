@@ -2,8 +2,6 @@
 
 (Attempts to) use Google's Gemini AI to detect objects in images, extract them, and remove their backgrounds automatically. Works okay, but not entirely reliable.
 
-**Prior Art**: Simon Willison, [Building a tool showing how Gemini Pro can return bounding boxes for objects in images](https://simonwillison.net/2024/Aug/26/gemini-bounding-box-visualization/).
-
 ## Overview
 
 This project combines the object detection capabilities of Google's Gemini AI with the background removal functionality of the `rembg` library to create an image processing pipeline. The tool:
@@ -34,7 +32,7 @@ This project combines the object detection capabilities of Google's Gemini AI wi
 1. Clone this repository:
 
 ```bash
-git clone https://github.com/yourusername/background-remover.git
+git clone https://github.com/Aias/background-remover.git
 cd background-remover
 ```
 
@@ -178,10 +176,11 @@ If background removal isn't working well:
 
 ## License
 
-[MIT License](LICENSE)
+This project is released under the MIT License.
 
 ## Acknowledgments
 
+-   Simon Willison, [Building a tool showing how Gemini Pro can return bounding boxes for objects in images](https://simonwillison.net/2024/Aug/26/gemini-bounding-box-visualization/)
 -   [Google Gemini AI](https://ai.google.dev/) for object detection
 -   [rembg](https://github.com/danielgatis/rembg) for background removal
 -   [Pillow](https://python-pillow.org/) for image processing
