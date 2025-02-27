@@ -8,15 +8,20 @@ This project combines the object detection capabilities of Google's Gemini AI wi
 
 1. Detects objects in images using Google Gemini AI
 2. Extracts each object by cropping it from the original image
-3. Removes the background from each extracted object
-4. Saves both the cropped objects and their background-removed versions
+3. Generates descriptive names for each object using AI
+4. Removes the background from each extracted object
+5. Saves both the cropped objects and their background-removed versions
 
 ## Features
 
 -   **AI-Powered Object Detection**: Uses Google Gemini 2.0 Flash to identify and locate objects in images
+-   **Intelligent Object Naming**: Separate AI step to generate descriptive names for each detected object
 -   **Automatic Background Removal**: Leverages the `rembg` library to create transparent backgrounds
+-   **Modular Processing Pipeline**: Separate detection, naming, and background removal steps
+-   **Multiple Processing Modes**: Support for "detect", "remove", or "all" processing modes
 -   **JSON Output**: Creates a JSON file with object metadata including bounding box coordinates
 -   **Optional Debug Mode**: Generates detailed debug visualizations when enabled
+-   **Safe File Handling**: Preserves original input files while processing
 
 ## Requirements
 
@@ -72,24 +77,35 @@ Process images in a specific directory:
 python extract_objects.py -i /path/to/images
 ```
 
+Specify an output directory different from the input:
+
+```bash
+python extract_objects.py -i /path/to/images -o /path/to/output
+```
+
 Enable debug mode to generate additional debug files and visualizations:
 
 ```bash
 python extract_objects.py -d
 ```
 
-Or combine both options:
+Choose a specific processing mode:
 
 ```bash
-python extract_objects.py -i /path/to/images -d
+python extract_objects.py -m detect  # Only detect and crop objects
+python extract_objects.py -m remove  # Only remove backgrounds from already cropped images
 ```
 
 ### Command-line Options
 
-| Option             | Description                                                                 |
-| ------------------ | --------------------------------------------------------------------------- |
-| `-i, --input PATH` | Input directory containing images (PNG/JPG). Defaults to current directory. |
-| `-d, --debug`      | Enable debug mode to save additional debug files and visualizations.        |
+| Option              | Description                                                                 |
+| ------------------- | --------------------------------------------------------------------------- |
+| `-i, --input PATH`  | Input directory containing images (PNG/JPG). Defaults to current directory. |
+| `-o, --output PATH` | Output directory for processed images. Defaults to `input_dir/processed`.   |
+| `-d, --debug`       | Enable debug mode to save additional debug files and visualizations.        |
+| `--no-watercolor`   | Disable watercolor mode (enabled by default).                               |
+| `-c, --clear`       | Clear the output directory before processing.                               |
+| `-m, --mode MODE`   | Processing mode: "all", "detect", or "remove". Default is "all".            |
 
 ### Output Structure
 
@@ -97,9 +113,7 @@ The script creates a `processed` directory with the following structure:
 
 ```
 processed/
-├── object1.png                # Cropped object with background
 ├── object1-final.png          # Object with background removed
-├── object2.png                # Another cropped object
 ├── object2-final.png          # Another object with background removed
 ├── bounding_boxes.json        # JSON file with object metadata
 └── debug/                     # Debug visualizations (only when debug mode is enabled)
@@ -119,18 +133,16 @@ The `bounding_boxes.json` file contains metadata about all detected objects:
 {
 	"image1.jpg": [
 		{
-			"object": "cup",
-			"bbox": [100, 150, 200, 250]
+			"object": "red ceramic coffee cup",
+			"bbox": [100, 150, 200, 250],
+			"crop_path": "path/to/cropped/image.png",
+			"original_name": "red ceramic coffee cup"
 		},
 		{
-			"object": "keyboard",
-			"bbox": [300, 400, 350, 550]
-		}
-	],
-	"image2.jpg": [
-		{
-			"object": "chair",
-			"bbox": [50, 100, 300, 400]
+			"object": "black wireless keyboard",
+			"bbox": [300, 400, 350, 550],
+			"crop_path": "path/to/cropped/image.png",
+			"original_name": "black wireless keyboard"
 		}
 	]
 }
@@ -142,11 +154,25 @@ The `bounding_boxes.json` file contains metadata about all detected objects:
 
 2. **Parsing and Normalization**: The JSON response from Gemini is parsed and normalized to handle various response formats.
 
-3. **Object Extraction**: Each detected object is cropped from the original image using the bounding box coordinates.
+3. **Object Extraction**: Each detected object is cropped from the original image using the bounding box coordinates and assigned a temporary filename.
 
-4. **Background Removal**: The `rembg` library processes each cropped object to remove its background.
+4. **Object Naming**: A separate AI step generates descriptive names for each cropped object individually.
 
-5. **Output Generation**: Both versions of each object (with and without background) are saved, along with debug visualizations and metadata.
+5. **Background Removal**: The `rembg` library processes each cropped object to remove its background.
+
+6. **Output Generation**: The background-removed images are saved with descriptive filenames, along with debug visualizations and metadata if debug mode is enabled.
+
+7. **Cleanup**: Temporary files are removed while preserving original input files.
+
+## Processing Modes
+
+The script supports three processing modes:
+
+1. **all** (default): Performs the complete pipeline - detection, cropping, naming, and background removal.
+
+2. **detect**: Only detects objects, crops them, and generates names. Useful when you want to manually review the cropped objects before background removal.
+
+3. **remove**: Processes already cropped images for background removal. Useful for batch processing pre-cropped images or when you want to reprocess images with different settings.
 
 ## Troubleshooting
 
