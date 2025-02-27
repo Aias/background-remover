@@ -251,7 +251,7 @@ def preprocess_image(image):
     img_pil = Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
     return img_pil
 
-def remove_background_color_based(image, color_tolerance=30, preserve_outlines=True):
+def remove_background_color_based(image, color_tolerance=30, preserve_outlines=True, gradient_opacity=True):
     """
     Removes background based on color detection rather than AI segmentation.
     This method is better at preserving outlines and text.
@@ -260,6 +260,7 @@ def remove_background_color_based(image, color_tolerance=30, preserve_outlines=T
         image: PIL Image to process
         color_tolerance: How much variation in background color to allow (higher = more aggressive)
         preserve_outlines: Whether to specifically preserve dark outlines
+        gradient_opacity: Whether to apply gradient-based opacity instead of binary transparency
         
     Returns:
         PIL Image with transparent background
@@ -273,7 +274,7 @@ def remove_background_color_based(image, color_tolerance=30, preserve_outlines=T
     height, width = open_cv_image.shape[:2]
     
     # Sample background color from corners of the image
-    # We'll take the average of the four corners to determine the background color
+    # We'll take the median of the four corners to determine the background color
     corner_size = 10  # Sample from 10x10 pixel areas in each corner
     corners = [
         open_cv_image[:corner_size, :corner_size],  # top-left
@@ -282,54 +283,105 @@ def remove_background_color_based(image, color_tolerance=30, preserve_outlines=T
         open_cv_image[-corner_size:, -corner_size:]  # bottom-right
     ]
     
-    # Calculate average background color (BGR)
+    # Calculate median background color (BGR)
     bg_samples = np.vstack([corner.reshape(-1, 3) for corner in corners])
     bg_color = np.median(bg_samples, axis=0).astype(np.int32)
     
     logging.info(f"Detected background color (BGR): {bg_color}")
     
-    # Vectorized approach for mask creation
-    # Create a mask where pixels similar to background color are white (255)
-    # Reshape image for vectorized color distance calculation
+    # Vectorized approach for color distance calculation
     flat_image = open_cv_image.reshape(-1, 3).astype(np.int32)
     
     # Calculate Euclidean distance for each pixel from background color
     distances = np.sqrt(np.sum((flat_image - bg_color)**2, axis=1))
     
-    # Create mask: True for background pixels (where distance < tolerance)
-    flat_mask = (distances < color_tolerance).astype(np.uint8) * 255
-    
-    # Reshape back to original image shape
-    mask = flat_mask.reshape(height, width)
-    
-    if preserve_outlines:
-        # Convert to grayscale to find edges/outlines
-        gray = cv2.cvtColor(open_cv_image, cv2.COLOR_BGR2GRAY)
+    if gradient_opacity:
+        # Create a gradient alpha mask based on color distance
+        # The further a color is from the background, the more opaque it will be
         
-        # Find edges using Canny edge detector
-        edges = cv2.Canny(gray, 50, 150)
+        # Normalize distances to create alpha values (0-255)
+        # Set a lower threshold to ensure even slight color variations are preserved
+        min_distance = 5  # Even slight deviations from background should have some opacity
         
-        # Dilate edges to make them more prominent
-        kernel = np.ones((2, 2), np.uint8)
-        dilated_edges = cv2.dilate(edges, kernel, iterations=1)
+        # Scale distances to 0-255 range for alpha channel
+        # Using a non-linear (sqrt) scaling to emphasize small differences in color
+        max_distance = float(np.max(distances)) if np.max(distances) > 0 else color_tolerance * 2
+        # Apply non-linear scaling to make even subtle color differences more visible
+        alpha_values = np.clip(
+            np.power(distances / max(max_distance, color_tolerance), 0.5) * 255, 
+            0, 255
+        ).astype(np.uint8)
         
-        # Add a check for very dark regions (which are likely outlines/text)
-        # This helps preserve text and dark outlines even if not detected by edge detection
-        gray_dark_mask = (gray < 50).astype(np.uint8) * 255
+        # Set minimum alpha for colors that deviate at all from background
+        alpha_values = np.where(
+            distances > min_distance,
+            np.maximum(alpha_values, 40),  # Minimum alpha for any color variation
+            alpha_values
+        )
         
-        # Combine edge detection with dark region detection
-        outline_mask = cv2.bitwise_or(dilated_edges, gray_dark_mask)
+        # Reshape alpha values to match image shape
+        alpha = alpha_values.reshape(height, width)
+    else:
+        # Binary approach (original method)
+        # Create mask: True for background pixels (where distance < tolerance)
+        flat_mask = (distances < color_tolerance).astype(np.uint8) * 255
         
-        # Preserve pixels that are part of edges/outlines (set to 0 in mask)
-        mask[outline_mask > 0] = 0
+        # Reshape back to original image shape
+        mask = flat_mask.reshape(height, width)
+        
+        if preserve_outlines:
+            # Convert to grayscale to find edges/outlines
+            gray = cv2.cvtColor(open_cv_image, cv2.COLOR_BGR2GRAY)
+            
+            # Find edges using Canny edge detector
+            edges = cv2.Canny(gray, 50, 150)
+            
+            # Dilate edges to make them more prominent
+            kernel = np.ones((2, 2), np.uint8)
+            dilated_edges = cv2.dilate(edges, kernel, iterations=1)
+            
+            # Add a check for very dark regions (which are likely outlines/text)
+            # This helps preserve text and dark outlines even if not detected by edge detection
+            gray_dark_mask = (gray < 50).astype(np.uint8) * 255
+            
+            # Combine edge detection with dark region detection
+            outline_mask = cv2.bitwise_or(dilated_edges, gray_dark_mask)
+            
+            # Preserve pixels that are part of edges/outlines (set to 0 in mask)
+            mask[outline_mask > 0] = 0
+        
+        # Invert mask (now foreground is white, background is black)
+        alpha = cv2.bitwise_not(mask)
     
-    # Invert mask (now foreground is white, background is black)
-    mask = cv2.bitwise_not(mask)
+    # Special handling for watercolor images - preserve even subtle color variations from background
+    # Create special mask for darker/colored areas in watercolor/illustration images
+    gray = cv2.cvtColor(open_cv_image, cv2.COLOR_BGR2GRAY)
     
-    # Create alpha channel from mask
-    alpha = mask.copy()
+    # For watercolor images, additionally increase opacity for:
+    # 1. Areas with high saturation (colored areas)
+    # 2. Areas significantly darker than background
     
-    # Convert back to PIL with transparency
+    # First convert to HSV to check saturation
+    hsv = cv2.cvtColor(open_cv_image, cv2.COLOR_BGR2HSV)
+    saturation = hsv[:, :, 1]
+    
+    # Calculate grayscale value of background color
+    bg_gray = 0.299 * bg_color[2] + 0.587 * bg_color[1] + 0.114 * bg_color[0]
+    
+    # Areas darker than background should be more opaque
+    darkness_diff = bg_gray - gray
+    darkness_mask = (darkness_diff > 15).astype(np.uint8) * 255
+    
+    # Areas with saturation should be more opaque
+    sat_mask = (saturation > 25).astype(np.uint8) * 255
+    
+    # Combine the masks
+    special_mask = cv2.bitwise_or(darkness_mask, sat_mask)
+    
+    # Apply the special mask to boost alpha values
+    alpha = np.maximum(alpha, special_mask)
+    
+    # Create alpha channel from the gradient mask
     bgra = cv2.cvtColor(open_cv_image, cv2.COLOR_BGR2BGRA)
     bgra[:, :, 3] = alpha
     
@@ -409,15 +461,17 @@ def remove_background_hybrid(image, bg_color_tolerance=30, use_ai_mask=True, deb
         bg_color_tolerance += 10
         logging.info(f"Line art detected: Increasing background color tolerance to {bg_color_tolerance}")
     
-    # First, use color-based removal as a base
+    # For watercolor images and line art, prioritize the gradient-based color removal
+    # This provides smooth transitions at edges and preserves subtle color variations
     color_based_result = remove_background_color_based(
         image, 
         color_tolerance=bg_color_tolerance,
-        preserve_outlines=True
+        preserve_outlines=True,
+        gradient_opacity=True  # Enable gradient-based opacity
     )
     
-    # For line art, if the AI mask might damage outlines,
-    # we can choose to use only color-based removal
+    # For line art and watercolors, the color-based approach with gradient opacity 
+    # may be sufficient without AI masking
     if line_art_mode and not use_ai_mask:
         return color_based_result
     
@@ -452,9 +506,10 @@ def remove_background_hybrid(image, bg_color_tolerance=30, use_ai_mask=True, deb
         
         # Set alpha scaling factor based on image type
         if line_art_mode:
-            # For line art, preserve more of the outlines even where AI thinks it's background
-            alpha_scale = 0.8  # Higher preservation for line art
-            logging.info("Using high outline preservation for line art/illustration")
+            # For line art and watercolors, prioritize preserving all color variations
+            # Don't let the AI mask remove too much
+            alpha_scale = 0.9  # Higher preservation for line art/watercolors
+            logging.info("Using very high outline preservation for line art/watercolor")
         else:
             # For photographic content, use moderate preservation
             alpha_scale = 0.3
@@ -462,9 +517,10 @@ def remove_background_hybrid(image, bg_color_tolerance=30, use_ai_mask=True, deb
         # Create a scaled alpha based on the AI mask
         # Where AI mask is white (255), keep full alpha
         # Where AI mask is black (0), reduce alpha by alpha_scale factor
+        # For line art/watercolors, we want to preserve more even where AI disagrees
         hybrid_alpha = np.where(
             ai_mask_np < 128,  # Where AI thinks it's background
-            (color_result_np[:, :, 3] * alpha_scale).astype(np.uint8),  # Reduce alpha
+            (color_result_np[:, :, 3] * alpha_scale).astype(np.uint8),  # Reduce alpha but don't remove
             color_result_np[:, :, 3]  # Keep original alpha
         )
         
