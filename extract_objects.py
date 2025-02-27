@@ -6,8 +6,10 @@ import traceback
 import re
 import concurrent.futures
 import subprocess
-from PIL import Image, ImageDraw
-from rembg import remove
+import numpy as np
+import cv2
+from PIL import Image, ImageDraw, ImageFilter
+from rembg import remove, new_session
 
 # Import Google Gemini generative AI SDK
 import google.generativeai as genai
@@ -59,32 +61,44 @@ def ensure_unique_filename(directory, base_name, extension=".png"):
 
 def detect_objects_with_gemini(image_path, debug=False):
     """
-    Use Google Gemini 1.5 Pro to detect objects in the image and return a list of 
+    Use Google Gemini to detect objects in the image and return a list of 
     objects with names and bounding boxes. Requires a configured API key.
     """
     # Load the image using PIL
     img = Image.open(image_path)
     img_width, img_height = img.size
     
-    # Prepare the prompt for Gemini: ask for JSON output with object names and bboxes
+    # Prepare an improved prompt for Gemini with clear instructions for structured output
     prompt = [
-        f"Return bounding boxes around every distinct object in the image. "
-        f"For each object detected, include: "
-        f"\"object\": <short descriptive name> and "
-        f"\"bbox\": [ymin, xmin, ymax, xmax] as a simple array of 4 integers (not an object). "
-        f"The coordinates should be in the range 0-1000, where 0,0 is the top-left corner and 1000,1000 is the bottom-right corner. "
-        f"The bounding box should be a bit larger than the object itself, to include some of the surrounding background area."
-        f"The descriptive name should be one or two short words that describe the object. "
-        f"Example of expected output format: [{{'object': 'cup', 'bbox': [100, 150, 200, 250]}}]. "
-        f"Do not use nested objects for the bbox values, just a flat array of 4 integers.",
+        "Identify every distinct object in this image and return a JSON array of their bounding boxes. "
+        "For each object detected, include: "
+        "\"object\": a short descriptive name (1-2 words) that clearly identifies what the object is, and "
+        "\"bbox\": [ymin, xmin, ymax, xmax] as a simple array of 4 integers representing coordinates. "
+        "The coordinates should be in the range 0-1000, where (0,0) is the top-left corner and (1000,1000) is the bottom-right corner. "
+        "Make the bounding box slightly larger than the object itself to include some surrounding context. "
+        "Example of expected output format: "
+        "```json\n"
+        "[{\"object\": \"coffee cup\", \"bbox\": [100, 150, 200, 250]}, "
+        "{\"object\": \"laptop\", \"bbox\": [300, 400, 600, 800]}]\n"
+        "```\n"
+        "Return ONLY the JSON array with no additional text or explanation.",
         img  # the image is provided to the model
     ]
     
     logging.info(f"Sending prompt to Gemini for {os.path.basename(image_path)}")
     
     try:
+        # Configure the model to use a low temperature for more deterministic results
+        # and request JSON output format
+        generation_config = genai.GenerationConfig(
+            temperature=0.1,  # Low temperature for more deterministic results
+            response_mime_type="application/json",  # Request JSON format
+            top_p=0.95,  # High top_p for more focused responses
+        )
+        
+        # Use Gemini 2.0 Flash for faster processing
         model = genai.GenerativeModel(model_name="gemini-2.0-flash")
-        response = model.generate_content(prompt)
+        response = model.generate_content(prompt, generation_config=generation_config)
     except Exception as e:
         logging.error(f"Gemini API call failed for image {os.path.basename(image_path)}: {e}")
         return None  # indicating failure
@@ -127,142 +141,84 @@ def detect_objects_with_gemini(image_path, debug=False):
         json_match = re.search(r'```(?:json)?\s*(\[[\s\S]*?\])\s*```', content)
         if json_match:
             json_str = json_match.group(1)
-            try:
-                raw_objects = json.loads(json_str)
-            except json.JSONDecodeError as e:
-                logging.error(f"JSON decode error: {e}")
-                logging.error(f"Problematic JSON: {json_str}")
-                # Try to fix common JSON issues
-                json_str = re.sub(r',\s*}', '}', json_str)  # Remove trailing commas in objects
-                json_str = re.sub(r',\s*]', ']', json_str)  # Remove trailing commas in arrays
-                try:
-                    raw_objects = json.loads(json_str)
-                except json.JSONDecodeError:
-                    logging.error("Failed to parse JSON even after cleanup")
-                    return None
-            
-            # Process the raw objects to normalize the bbox format
-            for obj in raw_objects:
-                name = obj.get("object", "object")
-                bbox = obj.get("bbox")
-                
-                # Handle different bbox formats
-                if isinstance(bbox, list):
-                    # If bbox is already a list of coordinates
-                    if len(bbox) == 4 and all(isinstance(x, (int, float)) for x in bbox):
-                        # Format is already [ymin, xmin, ymax, xmax]
-                        normalized_bbox = bbox
-                    else:
-                        # If bbox is a list containing an object with named fields
-                        if len(bbox) > 0 and isinstance(bbox[0], dict):
-                            bbox_obj = bbox[0]
-                            if all(k in bbox_obj for k in ["ymin", "xmin", "ymax", "xmax"]):
-                                normalized_bbox = [
-                                    bbox_obj["ymin"],
-                                    bbox_obj["xmin"],
-                                    bbox_obj["ymax"],
-                                    bbox_obj["xmax"]
-                                ]
-                            else:
-                                logging.warning(f"Skipping object with invalid bbox format: {bbox}")
-                                continue
-                        else:
-                            logging.warning(f"Skipping object with unexpected bbox format: {bbox}")
-                            continue
-                elif isinstance(bbox, dict):
-                    # If bbox is directly an object with named fields
-                    if all(k in bbox for k in ["ymin", "xmin", "ymax", "xmax"]):
-                        normalized_bbox = [
-                            bbox["ymin"],
-                            bbox["xmin"],
-                            bbox["ymax"],
-                            bbox["xmax"]
-                        ]
-                    else:
-                        logging.warning(f"Skipping object with invalid bbox keys: {bbox}")
-                        continue
-                else:
-                    logging.warning(f"Skipping object with unexpected bbox type: {type(bbox)}")
-                    continue
-                
-                # Add the normalized object to our results
-                objects.append({
-                    "object": name,
-                    "bbox": normalized_bbox
-                })
         else:
             # If not in code block, try to find array directly
             try:
-                start = content.index('[')
-                end = content.rindex(']')
-                json_str = content[start:end+1]
-                try:
-                    raw_objects = json.loads(json_str)
-                except json.JSONDecodeError as e:
-                    logging.error(f"JSON decode error: {e}")
-                    logging.error(f"Problematic JSON: {json_str}")
-                    # Try to fix common JSON issues
-                    json_str = re.sub(r',\s*}', '}', json_str)  # Remove trailing commas in objects
-                    json_str = re.sub(r',\s*]', ']', json_str)  # Remove trailing commas in arrays
-                    try:
-                        raw_objects = json.loads(json_str)
-                    except json.JSONDecodeError:
-                        logging.error("Failed to parse JSON even after cleanup")
-                        return None
-                
-                # Process the raw objects to normalize the bbox format (same as above)
-                for obj in raw_objects:
-                    name = obj.get("object", "object")
-                    bbox = obj.get("bbox")
-                    
-                    # Handle different bbox formats
-                    if isinstance(bbox, list):
-                        # If bbox is already a list of coordinates
-                        if len(bbox) == 4 and all(isinstance(x, (int, float)) for x in bbox):
-                            # Format is already [ymin, xmin, ymax, xmax]
-                            normalized_bbox = bbox
-                        else:
-                            # If bbox is a list containing an object with named fields
-                            if len(bbox) > 0 and isinstance(bbox[0], dict):
-                                bbox_obj = bbox[0]
-                                if all(k in bbox_obj for k in ["ymin", "xmin", "ymax", "xmax"]):
-                                    normalized_bbox = [
-                                        bbox_obj["ymin"],
-                                        bbox_obj["xmin"],
-                                        bbox_obj["ymax"],
-                                        bbox_obj["xmax"]
-                                    ]
-                                else:
-                                    logging.warning(f"Skipping object with invalid bbox format: {bbox}")
-                                    continue
-                            else:
-                                logging.warning(f"Skipping object with unexpected bbox format: {bbox}")
-                                continue
-                    elif isinstance(bbox, dict):
-                        # If bbox is directly an object with named fields
-                        if all(k in bbox for k in ["ymin", "xmin", "ymax", "xmax"]):
+                start = content.find('[')
+                end = content.rfind(']')
+                if start != -1 and end != -1 and end > start:
+                    json_str = content[start:end+1]
+                else:
+                    logging.error(f"Could not find JSON array in response for {os.path.basename(image_path)}")
+                    return None
+            except Exception as e:
+                logging.error(f"Failed to extract JSON from response: {e}")
+                return None
+        
+        # Try to parse the JSON
+        try:
+            raw_objects = json.loads(json_str)
+        except json.JSONDecodeError as e:
+            logging.error(f"JSON decode error: {e}")
+            logging.error(f"Problematic JSON: {json_str}")
+            # Try to fix common JSON issues
+            json_str = re.sub(r',\s*}', '}', json_str)  # Remove trailing commas in objects
+            json_str = re.sub(r',\s*]', ']', json_str)  # Remove trailing commas in arrays
+            try:
+                raw_objects = json.loads(json_str)
+            except json.JSONDecodeError:
+                logging.error("Failed to parse JSON even after cleanup")
+                return None
+        
+        # Process the raw objects to normalize the bbox format
+        for obj in raw_objects:
+            name = obj.get("object", "object")
+            bbox = obj.get("bbox")
+            
+            # Handle different bbox formats
+            if isinstance(bbox, list):
+                # If bbox is already a list of coordinates
+                if len(bbox) == 4 and all(isinstance(x, (int, float)) for x in bbox):
+                    # Format is already [ymin, xmin, ymax, xmax]
+                    normalized_bbox = bbox
+                else:
+                    # If bbox is a list containing an object with named fields
+                    if len(bbox) > 0 and isinstance(bbox[0], dict):
+                        bbox_obj = bbox[0]
+                        if all(k in bbox_obj for k in ["ymin", "xmin", "ymax", "xmax"]):
                             normalized_bbox = [
-                                bbox["ymin"],
-                                bbox["xmin"],
-                                bbox["ymax"],
-                                bbox["xmax"]
+                                bbox_obj["ymin"],
+                                bbox_obj["xmin"],
+                                bbox_obj["ymax"],
+                                bbox_obj["xmax"]
                             ]
                         else:
-                            logging.warning(f"Skipping object with invalid bbox keys: {bbox}")
+                            logging.warning(f"Skipping object with invalid bbox format: {bbox}")
                             continue
                     else:
-                        logging.warning(f"Skipping object with unexpected bbox type: {type(bbox)}")
+                        logging.warning(f"Skipping object with unexpected bbox format: {bbox}")
                         continue
-                    
-                    # Add the normalized object to our results
-                    objects.append({
-                        "object": name,
-                        "bbox": normalized_bbox
-                    })
-            except (ValueError, json.JSONDecodeError) as e:
-                logging.error(f"Failed to extract JSON from response for {os.path.basename(image_path)}: {e}")
-                logging.debug(f"Response content: {content}")
-                return None
+            elif isinstance(bbox, dict):
+                # If bbox is directly an object with named fields
+                if all(k in bbox for k in ["ymin", "xmin", "ymax", "xmax"]):
+                    normalized_bbox = [
+                        bbox["ymin"],
+                        bbox["xmin"],
+                        bbox["ymax"],
+                        bbox["xmax"]
+                    ]
+                else:
+                    logging.warning(f"Skipping object with invalid bbox keys: {bbox}")
+                    continue
+            else:
+                logging.warning(f"Skipping object with unexpected bbox type: {type(bbox)}")
+                continue
+            
+            # Add the normalized object to our results
+            objects.append({
+                "object": name,
+                "bbox": normalized_bbox
+            })
                 
     except Exception as parse_err:
         logging.error(f"Failed to parse response from model for {os.path.basename(image_path)}: {parse_err}")
@@ -270,6 +226,266 @@ def detect_objects_with_gemini(image_path, debug=False):
         return None
         
     return objects  # list of dicts like {"object": "...", "bbox": [ymin, xmin, ymax, xmax]}
+
+def preprocess_image(image):
+    """
+    Preprocess the image to improve segmentation results.
+    Apply gentle denoising and contrast enhancement.
+    """
+    # Convert PIL image to OpenCV format
+    img_cv = np.array(image)
+    img_cv = img_cv[:, :, ::-1].copy()  # RGB to BGR for OpenCV
+    
+    # Apply gentle denoising
+    img_cv = cv2.fastNlMeansDenoisingColored(img_cv, None, 5, 5, 7, 21)
+    
+    # Enhance contrast using CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    lab = cv2.cvtColor(img_cv, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    lab = cv2.merge((l, a, b))
+    img_cv = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    
+    # Convert back to PIL image
+    img_pil = Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
+    return img_pil
+
+def remove_background_color_based(image, color_tolerance=30, preserve_outlines=True):
+    """
+    Removes background based on color detection rather than AI segmentation.
+    This method is better at preserving outlines and text.
+    
+    Args:
+        image: PIL Image to process
+        color_tolerance: How much variation in background color to allow (higher = more aggressive)
+        preserve_outlines: Whether to specifically preserve dark outlines
+        
+    Returns:
+        PIL Image with transparent background
+    """
+    # Convert PIL to OpenCV
+    open_cv_image = np.array(image)
+    # Convert RGB to BGR (OpenCV format)
+    open_cv_image = open_cv_image[:, :, ::-1].copy()
+    
+    # Get image dimensions
+    height, width = open_cv_image.shape[:2]
+    
+    # Sample background color from corners of the image
+    # We'll take the average of the four corners to determine the background color
+    corner_size = 10  # Sample from 10x10 pixel areas in each corner
+    corners = [
+        open_cv_image[:corner_size, :corner_size],  # top-left
+        open_cv_image[:corner_size, -corner_size:],  # top-right
+        open_cv_image[-corner_size:, :corner_size],  # bottom-left
+        open_cv_image[-corner_size:, -corner_size:]  # bottom-right
+    ]
+    
+    # Calculate average background color (BGR)
+    bg_samples = np.vstack([corner.reshape(-1, 3) for corner in corners])
+    bg_color = np.median(bg_samples, axis=0).astype(np.int32)
+    
+    logging.info(f"Detected background color (BGR): {bg_color}")
+    
+    # Vectorized approach for mask creation
+    # Create a mask where pixels similar to background color are white (255)
+    # Reshape image for vectorized color distance calculation
+    flat_image = open_cv_image.reshape(-1, 3).astype(np.int32)
+    
+    # Calculate Euclidean distance for each pixel from background color
+    distances = np.sqrt(np.sum((flat_image - bg_color)**2, axis=1))
+    
+    # Create mask: True for background pixels (where distance < tolerance)
+    flat_mask = (distances < color_tolerance).astype(np.uint8) * 255
+    
+    # Reshape back to original image shape
+    mask = flat_mask.reshape(height, width)
+    
+    if preserve_outlines:
+        # Convert to grayscale to find edges/outlines
+        gray = cv2.cvtColor(open_cv_image, cv2.COLOR_BGR2GRAY)
+        
+        # Find edges using Canny edge detector
+        edges = cv2.Canny(gray, 50, 150)
+        
+        # Dilate edges to make them more prominent
+        kernel = np.ones((2, 2), np.uint8)
+        dilated_edges = cv2.dilate(edges, kernel, iterations=1)
+        
+        # Add a check for very dark regions (which are likely outlines/text)
+        # This helps preserve text and dark outlines even if not detected by edge detection
+        gray_dark_mask = (gray < 50).astype(np.uint8) * 255
+        
+        # Combine edge detection with dark region detection
+        outline_mask = cv2.bitwise_or(dilated_edges, gray_dark_mask)
+        
+        # Preserve pixels that are part of edges/outlines (set to 0 in mask)
+        mask[outline_mask > 0] = 0
+    
+    # Invert mask (now foreground is white, background is black)
+    mask = cv2.bitwise_not(mask)
+    
+    # Create alpha channel from mask
+    alpha = mask.copy()
+    
+    # Convert back to PIL with transparency
+    bgra = cv2.cvtColor(open_cv_image, cv2.COLOR_BGR2BGRA)
+    bgra[:, :, 3] = alpha
+    
+    # Convert back to PIL
+    result_img = Image.fromarray(cv2.cvtColor(bgra, cv2.COLOR_BGRA2RGBA))
+    
+    # Apply a slight blur to the alpha channel to smooth edges
+    r, g, b, a = result_img.split()
+    a = a.filter(ImageFilter.GaussianBlur(radius=0.5))
+    result_img = Image.merge('RGBA', (r, g, b, a))
+    
+    return result_img
+
+def is_line_art(image, edge_threshold=0.05, dark_threshold=50):
+    """
+    Detect if an image is likely to be line art, illustration, or contain significant outlines.
+    This helps determine which background removal approach to prioritize.
+    
+    Args:
+        image: PIL Image to check
+        edge_threshold: Percentage of pixels that need to be edges to consider line art
+        dark_threshold: Pixel value threshold to consider a pixel "dark" (0-255)
+        
+    Returns:
+        Boolean indicating if image appears to be line art
+    """
+    # Convert to OpenCV format
+    img_cv = np.array(image)
+    img_cv = img_cv[:, :, ::-1].copy()  # RGB to BGR
+    
+    # Convert to grayscale
+    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+    
+    # Detect edges
+    edges = cv2.Canny(gray, 50, 150)
+    
+    # Count edge pixels
+    edge_count = np.count_nonzero(edges)
+    total_pixels = edges.shape[0] * edges.shape[1]
+    edge_ratio = edge_count / total_pixels
+    
+    # Count dark pixels (likely lines/text)
+    dark_count = np.count_nonzero(gray < dark_threshold)
+    dark_ratio = dark_count / total_pixels
+    
+    # Check if image has high edge density or significant dark lines
+    is_illustration = (edge_ratio > edge_threshold) or (dark_ratio > 0.01)
+    
+    logging.info(f"Image analysis - Edge ratio: {edge_ratio:.4f}, Dark pixel ratio: {dark_ratio:.4f}")
+    logging.info(f"Image is {'likely' if is_illustration else 'not likely'} to be line art/illustration")
+    
+    return is_illustration
+
+def remove_background_hybrid(image, bg_color_tolerance=30, use_ai_mask=True, debug=False, debug_dir=None, name="object"):
+    """
+    Hybrid background removal that combines AI-based and color-based approaches
+    to better preserve outlines while still removing backgrounds effectively.
+    
+    Args:
+        image: PIL Image to process
+        bg_color_tolerance: Tolerance for background color detection
+        use_ai_mask: Whether to use rembg's AI-based mask
+        debug: Whether to save debug information
+        debug_dir: Directory to save debug info
+        name: Name of the object for debug files
+        
+    Returns:
+        PIL Image with transparent background
+    """
+    # Check if the image is likely line art or illustration
+    line_art_mode = is_line_art(image)
+    
+    # Adjust color tolerance based on image type
+    if line_art_mode:
+        # Use higher tolerance for line art - we want to remove more background
+        # while still preserving the lines
+        bg_color_tolerance += 10
+        logging.info(f"Line art detected: Increasing background color tolerance to {bg_color_tolerance}")
+    
+    # First, use color-based removal as a base
+    color_based_result = remove_background_color_based(
+        image, 
+        color_tolerance=bg_color_tolerance,
+        preserve_outlines=True
+    )
+    
+    # For line art, if the AI mask might damage outlines,
+    # we can choose to use only color-based removal
+    if line_art_mode and not use_ai_mask:
+        return color_based_result
+    
+    # If we want to use AI (rembg) as well, create a session
+    try:
+        rembg_session = new_session("isnet-general-use")
+    except Exception as e:
+        logging.warning(f"Failed to initialize rembg session: {e}")
+        return color_based_result
+    
+    # Use rembg to get an AI-generated mask
+    try:
+        # Get only the mask from rembg
+        ai_mask = remove(
+            image,
+            session=rembg_session,
+            only_mask=True
+        )
+        
+        if debug and debug_dir:
+            ai_mask_path = os.path.join(debug_dir, f"{name}_ai_mask.png")
+            ai_mask.save(ai_mask_path)
+            logging.info(f"Saved AI mask to {ai_mask_path}")
+        
+        # Convert masks to numpy arrays
+        ai_mask_np = np.array(ai_mask)
+        color_result_np = np.array(color_based_result)
+        
+        # Create a hybrid result - use color-based result but only keep pixels where AI says is foreground
+        # This preserves outlines from the color-based approach
+        hybrid_result = color_result_np.copy()
+        
+        # Set alpha scaling factor based on image type
+        if line_art_mode:
+            # For line art, preserve more of the outlines even where AI thinks it's background
+            alpha_scale = 0.8  # Higher preservation for line art
+            logging.info("Using high outline preservation for line art/illustration")
+        else:
+            # For photographic content, use moderate preservation
+            alpha_scale = 0.3
+        
+        # Create a scaled alpha based on the AI mask
+        # Where AI mask is white (255), keep full alpha
+        # Where AI mask is black (0), reduce alpha by alpha_scale factor
+        hybrid_alpha = np.where(
+            ai_mask_np < 128,  # Where AI thinks it's background
+            (color_result_np[:, :, 3] * alpha_scale).astype(np.uint8),  # Reduce alpha
+            color_result_np[:, :, 3]  # Keep original alpha
+        )
+        
+        # Update the alpha channel
+        hybrid_result[:, :, 3] = hybrid_alpha
+        
+        # Convert back to PIL
+        final_result = Image.fromarray(hybrid_result)
+        
+        if debug and debug_dir:
+            color_result_path = os.path.join(debug_dir, f"{name}_color_based.png")
+            hybrid_result_path = os.path.join(debug_dir, f"{name}_hybrid.png")
+            color_based_result.save(color_result_path)
+            final_result.save(hybrid_result_path)
+            logging.info(f"Saved color-based and hybrid results for comparison")
+        
+        return final_result
+    
+    except Exception as e:
+        logging.error(f"Error in hybrid background removal: {e}")
+        return color_based_result  # Fall back to color-based approach
 
 def process_image(image_path, output_dir, debug=False):
     """Process a single image: detect objects, crop them, remove background, and save results."""
@@ -294,13 +510,18 @@ def process_image(image_path, output_dir, debug=False):
         img_width, img_height = image.size
         logging.info(f"Image dimensions: {img_width}x{img_height}")
         
-        # Save original image for debugging if debug is enabled
+        # Preprocess the image to improve segmentation results
+        preprocessed_image = preprocess_image(image)
+        
+        # Save original and preprocessed images for debugging if debug is enabled
         if debug:
             debug_dir = os.path.join(output_dir, "debug")
             os.makedirs(debug_dir, exist_ok=True)
             debug_original = os.path.join(debug_dir, f"original_{img_name}")
             image.save(debug_original)
-            logging.info(f"Saved original image for debugging to {debug_original}")
+            debug_preprocessed = os.path.join(debug_dir, f"preprocessed_{img_name}")
+            preprocessed_image.save(debug_preprocessed)
+            logging.info(f"Saved original and preprocessed images for debugging")
     except Exception as e:
         logging.error(f"Failed to open image {img_name}: {e}")
         return None
@@ -351,6 +572,16 @@ def process_image(image_path, output_dir, debug=False):
                 
                 logging.info(f"Scaled bbox from normalized [ymin={ymin_norm}, xmin={xmin_norm}, ymax={ymax_norm}, xmax={xmax_norm}] to actual [ymin={ymin}, xmin={xmin}, ymax={ymax}, xmax={xmax}]")
                 
+                # Add padding to the bounding box (5% of width/height)
+                padding_x = int(0.05 * (xmax - xmin))
+                padding_y = int(0.05 * (ymax - ymin))
+                
+                # Apply padding and ensure within image bounds
+                xmin = max(0, xmin - padding_x)
+                ymin = max(0, ymin - padding_y)
+                xmax = min(img_width, xmax + padding_x)
+                ymax = min(img_height, ymax + padding_y)
+                
                 # Calculate width and height for later use
                 width = xmax - xmin
                 height = ymax - ymin
@@ -358,29 +589,15 @@ def process_image(image_path, output_dir, debug=False):
                 # Crop region is (left, top, right, bottom)
                 crop_region = (xmin, ymin, xmax, ymax)
                 
+                logging.info(f"Padded crop region: {crop_region}")
+                
             except (ValueError, TypeError):
                 logging.warning(f"Skipping object with non-numeric bbox values in {img_name}: {obj}")
                 continue
                 
-            logging.info(f"Calculated crop region: {crop_region}")
-            
-            # Ensure crop region is within image bounds
-            if xmin < 0 or ymin < 0 or xmax > img_width or ymax > img_height:
-                logging.warning(f"Adjusting crop region to fit within image bounds for {name} in {img_name}")
-                orig_region = crop_region
-                xmin = max(0, xmin)
-                ymin = max(0, ymin)
-                xmax = min(xmax, img_width)
-                ymax = min(ymax, img_height)
-                # Recalculate width and height
-                width = xmax - xmin
-                height = ymax - ymin
-                crop_region = (xmin, ymin, xmax, ymax)
-                logging.info(f"Adjusted crop region from {orig_region} to {crop_region}")
-                
             # Skip if resulting crop region is too small
-            if width <= 0 or height <= 0:
-                logging.warning(f"Skipping {name} in {img_name} due to invalid crop dimensions: {width}x{height}")
+            if width <= 10 or height <= 10:
+                logging.warning(f"Skipping {name} in {img_name} due to too small crop dimensions: {width}x{height}")
                 continue
             
             # Save a debug visualization of the bounding box on the original image if debug is enabled
@@ -399,7 +616,8 @@ def process_image(image_path, output_dir, debug=False):
                 except Exception as e:
                     logging.error(f"Failed to create debug visualization: {e}")
                 
-            cropped_img = image.crop(crop_region)
+            # Crop from the preprocessed image for better segmentation
+            cropped_img = preprocessed_image.crop(crop_region)
             
             # Save a debug version of the cropped image if debug is enabled
             if debug:
@@ -420,20 +638,42 @@ def process_image(image_path, output_dir, debug=False):
             cropped_path = os.path.join(output_dir, obj_filename)
             cropped_img.save(cropped_path, format="PNG")
             
-            # Remove background using rembg
-            try:
-                cropped_img_rgba = Image.open(cropped_path)  # reopen to ensure compatibility with rembg
-                output_img = remove(cropped_img_rgba)       # remove background
-            except Exception as re:
-                logging.error(f"rembg failed for {obj_filename}: {re}")
-                # Continue without background removal (skip final image)
-                output_img = None
+            # Use our hybrid background removal method
+            debug_id = f"{img_name.split('.')[0]}_{obj_index}_{name}" if debug else None
+            output_img = remove_background_hybrid(
+                cropped_img, 
+                bg_color_tolerance=40,  # Slightly higher tolerance
+                use_ai_mask=True,       # Use both AI and color-based approaches
+                debug=debug,
+                debug_dir=debug_dir,
+                name=debug_id
+            )
+            
+            # For comparison, also save the original rembg result if in debug mode
+            if debug:
+                try:
+                    rembg_session = new_session("isnet-general-use")
+                    rembg_output = remove(
+                        cropped_img,
+                        session=rembg_session,
+                        alpha_matting=True,
+                        alpha_matting_foreground_threshold=240,
+                        alpha_matting_background_threshold=10,
+                        alpha_matting_erode_size=10,
+                        post_process_mask=True
+                    )
+                    rembg_path = os.path.join(debug_dir, f"{debug_id}_rembg.png")
+                    rembg_output.save(rembg_path)
+                    logging.info(f"Saved original rembg output to {rembg_path}")
+                except Exception as e:
+                    logging.error(f"Failed to save rembg comparison: {e}")
             
             # Save background-removed image if successful
             if output_img:
                 final_name = obj_base + "-final.png"
                 final_path = os.path.join(output_dir, final_name)
                 output_img.save(final_path, format="PNG")
+                logging.info(f"Saved background-removed image to {final_path}")
             
             # Record the object info for JSON (use original name and bbox)
             result_entry.append({
