@@ -11,6 +11,7 @@ import cv2
 from PIL import Image, ImageDraw, ImageFilter
 from rembg import remove, new_session
 import shutil  # Add shutil for directory operations
+import time  # Add time for sleep function
 
 # Import Google Gemini generative AI SDK
 import google.generativeai as genai
@@ -128,168 +129,192 @@ def detect_objects_with_gemini(image_path, debug=False):
     Use Google Gemini to detect objects in the image and return a list of 
     objects with bounding boxes. Requires a configured API key.
     """
-    # Load the image using PIL
-    img = Image.open(image_path)
-    img_width, img_height = img.size
+    # Maximum number of retries for rate limit errors
+    max_retries = 3
+    retry_count = 0
+    base_delay = 5  # Base delay in seconds
     
-    # Prepare a simplified prompt for Gemini that focuses only on object detection, not naming
-    prompt = [
-        "Identify every distinct object in this image and return a JSON array of their bounding boxes. "
-        "For each object detected, include: "
-        "\"bbox\": [ymin, xmin, ymax, xmax] as a simple array of 4 integers representing coordinates. "
-        "The coordinates should be in the range 0-1000, where (0,0) is the top-left corner and (1000,1000) is the bottom-right corner. "
-        "Make the bounding box slightly larger than the object itself to include some surrounding context. "
-        "Example of expected output format: "
-        "```json\n"
-        "[{\"bbox\": [100, 150, 200, 250]}, "
-        "{\"bbox\": [300, 400, 600, 800]}]\n"
-        "```\n"
-        "Return ONLY the JSON array with no additional text or explanation.",
-        img  # the image is provided to the model
-    ]
-    
-    logging.info(f"Sending prompt to Gemini for {os.path.basename(image_path)}")
-    
-    try:
-        # Configure the model to use a low temperature for more deterministic results
-        # and request JSON output format
-        generation_config = genai.GenerationConfig(
-            temperature=0.1,  # Low temperature for more deterministic results
-            response_mime_type="application/json",  # Request JSON format
-            top_p=0.95,  # High top_p for more focused responses
-        )
+    while retry_count <= max_retries:
+        # Load the image using PIL
+        img = Image.open(image_path)
+        img_width, img_height = img.size
         
-        # Use Gemini 2.0 Flash for faster processing
-        model = genai.GenerativeModel(model_name="gemini-2.0-flash")
-        response = model.generate_content(prompt, generation_config=generation_config)
-    except Exception as e:
-        logging.error(f"Gemini API call failed for image {os.path.basename(image_path)}: {e}")
-        return None  # indicating failure
-    
-    # Extract the text content from the response
-    try:
-        # The response structure has a content field with parts that contain text
-        if hasattr(response, 'text'):
-            # For newer API versions that have a text property
-            content = response.text
-        elif hasattr(response, 'parts'):
-            # For some API versions
-            content = ''.join([part.text for part in response.parts])
-        elif hasattr(response, 'content') and hasattr(response.content, 'parts'):
-            # For the structure seen in the error logs
-            content = ''.join([part.get('text', '') for part in response.content.parts])
-        else:
-            # Fallback to string representation
-            content = str(response)
+        # Prepare a simplified prompt for Gemini that focuses only on object detection, not naming
+        prompt = [
+            "Identify every distinct object in this image and return a JSON array of their bounding boxes. "
+            "For each object detected, include: "
+            "\"bbox\": [ymin, xmin, ymax, xmax] as a simple array of 4 integers representing coordinates. "
+            "The coordinates should be in the range 0-1000, where (0,0) is the top-left corner and (1000,1000) is the bottom-right corner. "
+            "Make the bounding box slightly larger than the object itself to include some surrounding context. "
+            "Example of expected output format: "
+            "```json\n"
+            "[{\"bbox\": [100, 150, 200, 250]}, "
+            "{\"bbox\": [300, 400, 600, 800]}]\n"
+            "```\n"
+            "Return ONLY the JSON array with no additional text or explanation.",
+            img  # the image is provided to the model
+        ]
         
-        # Log the raw response for debugging if debug is enabled
-        if debug:
-            debug_dir = os.path.join(os.path.dirname(image_path), "processed", "debug")
-            os.makedirs(debug_dir, exist_ok=True)
-            debug_response_path = os.path.join(debug_dir, f"{os.path.basename(image_path)}_gemini_response.txt")
-            with open(debug_response_path, 'w') as f:
-                f.write(content)
-            logging.info(f"Saved raw Gemini response to {debug_response_path}")
+        logging.info(f"Sending prompt to Gemini for {os.path.basename(image_path)}")
         
-        # Clean up the JSON response to fix common issues
-        # Replace single quotes with double quotes for valid JSON
-        content = content.replace("'", "\"")
-        # Remove trailing commas which are invalid in JSON
-        content = re.sub(r',(\s*[}\]])', r'\1', content)
-        
-        # Now extract the JSON part from the content
-        objects = []
-        
-        # Look for JSON array in markdown code blocks
-        json_match = re.search(r'```(?:json)?\s*(\[[\s\S]*?\])\s*```', content)
-        if json_match:
-            json_str = json_match.group(1)
-        else:
-            # If not in code block, try to find array directly
-            try:
-                start = content.find('[')
-                end = content.rfind(']')
-                if start != -1 and end != -1 and end > start:
-                    json_str = content[start:end+1]
-                else:
-                    logging.error(f"Could not find JSON array in response for {os.path.basename(image_path)}")
-                    return None
-            except Exception as e:
-                logging.error(f"Failed to extract JSON from response: {e}")
-                return None
-        
-        # Try to parse the JSON
         try:
-            raw_objects = json.loads(json_str)
-        except json.JSONDecodeError as e:
-            logging.error(f"JSON decode error: {e}")
-            logging.error(f"Problematic JSON: {json_str}")
-            # Try to fix common JSON issues
-            json_str = re.sub(r',\s*}', '}', json_str)  # Remove trailing commas in objects
-            json_str = re.sub(r',\s*]', ']', json_str)  # Remove trailing commas in arrays
-            try:
-                raw_objects = json.loads(json_str)
-            except json.JSONDecodeError:
-                logging.error("Failed to parse JSON even after cleanup")
-                return None
-        
-        # Process the raw objects to normalize the bbox format
-        for obj_index, obj in enumerate(raw_objects):
-            # Initialize with a generic object name
-            name = f"object_{obj_index+1}"
-            bbox = obj.get("bbox")
+            # Configure the model to use a low temperature for more deterministic results
+            # and request JSON output format
+            generation_config = genai.GenerationConfig(
+                temperature=0.1,  # Low temperature for more deterministic results
+                response_mime_type="application/json",  # Request JSON format
+                top_p=0.95,  # High top_p for more focused responses
+            )
             
-            # Handle different bbox formats
-            if isinstance(bbox, list):
-                # If bbox is already a list of coordinates
-                if len(bbox) == 4 and all(isinstance(x, (int, float)) for x in bbox):
-                    # Format is already [ymin, xmin, ymax, xmax]
-                    normalized_bbox = bbox
+            # Use Gemini 2.0 Flash for faster processing
+            model = genai.GenerativeModel(model_name="gemini-2.0-flash")
+            response = model.generate_content(prompt, generation_config=generation_config)
+            
+            # Extract the text content from the response
+            try:
+                # The response structure has a content field with parts that contain text
+                if hasattr(response, 'text'):
+                    # For newer API versions that have a text property
+                    content = response.text
+                elif hasattr(response, 'parts'):
+                    # For some API versions
+                    content = ''.join([part.text for part in response.parts])
+                elif hasattr(response, 'content') and hasattr(response.content, 'parts'):
+                    # For the structure seen in the error logs
+                    content = ''.join([part.get('text', '') for part in response.content.parts])
                 else:
-                    # If bbox is a list containing an object with named fields
-                    if len(bbox) > 0 and isinstance(bbox[0], dict):
-                        bbox_obj = bbox[0]
-                        if all(k in bbox_obj for k in ["ymin", "xmin", "ymax", "xmax"]):
+                    # Fallback to string representation
+                    content = str(response)
+                
+                # Log the raw response for debugging if debug is enabled
+                if debug:
+                    debug_dir = os.path.join(os.path.dirname(image_path), "processed", "debug")
+                    os.makedirs(debug_dir, exist_ok=True)
+                    debug_response_path = os.path.join(debug_dir, f"{os.path.basename(image_path)}_gemini_response.txt")
+                    with open(debug_response_path, 'w') as f:
+                        f.write(content)
+                    logging.info(f"Saved raw Gemini response to {debug_response_path}")
+                
+                # Clean up the JSON response to fix common issues
+                # Replace single quotes with double quotes for valid JSON
+                content = content.replace("'", "\"")
+                # Remove trailing commas which are invalid in JSON
+                content = re.sub(r',(\s*[}\]])', r'\1', content)
+                
+                # Now extract the JSON part from the content
+                objects = []
+                
+                # Look for JSON array in markdown code blocks
+                json_match = re.search(r'```(?:json)?\s*(\[[\s\S]*?\])\s*```', content)
+                if json_match:
+                    json_str = json_match.group(1)
+                else:
+                    # If not in code block, try to find array directly
+                    try:
+                        start = content.find('[')
+                        end = content.rfind(']')
+                        if start != -1 and end != -1 and end > start:
+                            json_str = content[start:end+1]
+                        else:
+                            logging.error(f"Could not find JSON array in response for {os.path.basename(image_path)}")
+                            return None
+                    except Exception as e:
+                        logging.error(f"Failed to extract JSON from response: {e}")
+                        return None
+                
+                # Try to parse the JSON
+                try:
+                    raw_objects = json.loads(json_str)
+                except json.JSONDecodeError as e:
+                    logging.error(f"JSON decode error: {e}")
+                    logging.error(f"Problematic JSON: {json_str}")
+                    # Try to fix common JSON issues
+                    json_str = re.sub(r',\s*}', '}', json_str)  # Remove trailing commas in objects
+                    json_str = re.sub(r',\s*]', ']', json_str)  # Remove trailing commas in arrays
+                    try:
+                        raw_objects = json.loads(json_str)
+                    except json.JSONDecodeError:
+                        logging.error("Failed to parse JSON even after cleanup")
+                        return None
+                
+                # Process the raw objects to normalize the bbox format
+                for obj_index, obj in enumerate(raw_objects):
+                    # Initialize with a generic object name
+                    name = f"object_{obj_index+1}"
+                    bbox = obj.get("bbox")
+                    
+                    # Handle different bbox formats
+                    if isinstance(bbox, list):
+                        # If bbox is already a list of coordinates
+                        if len(bbox) == 4 and all(isinstance(x, (int, float)) for x in bbox):
+                            # Format is already [ymin, xmin, ymax, xmax]
+                            normalized_bbox = bbox
+                        else:
+                            # If bbox is a list containing an object with named fields
+                            if len(bbox) > 0 and isinstance(bbox[0], dict):
+                                bbox_obj = bbox[0]
+                                if all(k in bbox_obj for k in ["ymin", "xmin", "ymax", "xmax"]):
+                                    normalized_bbox = [
+                                        bbox_obj["ymin"],
+                                        bbox_obj["xmin"],
+                                        bbox_obj["ymax"],
+                                        bbox_obj["xmax"]
+                                    ]
+                                else:
+                                    logging.warning(f"Skipping object with invalid bbox format: {bbox}")
+                                    continue
+                            else:
+                                logging.warning(f"Skipping object with unexpected bbox format: {bbox}")
+                                continue
+                    elif isinstance(bbox, dict):
+                        # If bbox is directly an object with named fields
+                        if all(k in bbox for k in ["ymin", "xmin", "ymax", "xmax"]):
                             normalized_bbox = [
-                                bbox_obj["ymin"],
-                                bbox_obj["xmin"],
-                                bbox_obj["ymax"],
-                                bbox_obj["xmax"]
+                                bbox["ymin"],
+                                bbox["xmin"],
+                                bbox["ymax"],
+                                bbox["xmax"]
                             ]
                         else:
-                            logging.warning(f"Skipping object with invalid bbox format: {bbox}")
+                            logging.warning(f"Skipping object with invalid bbox keys: {bbox}")
                             continue
                     else:
-                        logging.warning(f"Skipping object with unexpected bbox format: {bbox}")
+                        logging.warning(f"Skipping object with unexpected bbox type: {type(bbox)}")
                         continue
-            elif isinstance(bbox, dict):
-                # If bbox is directly an object with named fields
-                if all(k in bbox for k in ["ymin", "xmin", "ymax", "xmax"]):
-                    normalized_bbox = [
-                        bbox["ymin"],
-                        bbox["xmin"],
-                        bbox["ymax"],
-                        bbox["xmax"]
-                    ]
-                else:
-                    logging.warning(f"Skipping object with invalid bbox keys: {bbox}")
-                    continue
-            else:
-                logging.warning(f"Skipping object with unexpected bbox type: {type(bbox)}")
-                continue
-            
-            # Add the normalized object to our results
-            objects.append({
-                "object": name,  # Use a generic name initially
-                "bbox": normalized_bbox
-            })
+                    
+                    # Add the normalized object to our results
+                    objects.append({
+                        "object": name,  # Use a generic name initially
+                        "bbox": normalized_bbox
+                    })
                 
-    except Exception as parse_err:
-        logging.error(f"Failed to parse response from model for {os.path.basename(image_path)}: {parse_err}")
-        logging.debug(f"Raw response: {response}")
-        return None
-        
-    return objects  # list of dicts like {"object": "object_1", "bbox": [ymin, xmin, ymax, xmax]}
+                # Successfully processed, return the objects
+                return objects  # list of dicts like {"object": "object_1", "bbox": [ymin, xmin, ymax, xmax]}
+                    
+            except Exception as parse_err:
+                logging.error(f"Failed to parse response from model for {os.path.basename(image_path)}: {parse_err}")
+                logging.debug(f"Raw response: {response}")
+                return None
+                
+        except Exception as e:
+            error_message = str(e)
+            
+            # Check if this is a rate limit error (429)
+            if "429" in error_message and "Resource has been exhausted" in error_message:
+                retry_count += 1
+                if retry_count <= max_retries:
+                    # Calculate exponential backoff delay: base_delay * 2^retry_count
+                    delay = base_delay * (2 ** (retry_count - 1))
+                    logging.warning(f"Rate limit exceeded for {os.path.basename(image_path)}. Retrying in {delay} seconds... (Attempt {retry_count}/{max_retries})")
+                    time.sleep(delay)
+                    continue
+                else:
+                    logging.error(f"Max retries reached for rate limit on {os.path.basename(image_path)}.")
+                    return None
+            else:
+                # For other errors, log and return None
+                logging.error(f"Gemini API call failed for image {os.path.basename(image_path)}: {e}")
+                return None  # indicating failure
 
 def generate_object_name_for_image(crop_path, debug=False, debug_dir=None, original_image_path=None):
     """
@@ -304,57 +329,82 @@ def generate_object_name_for_image(crop_path, debug=False, debug_dir=None, origi
     Returns:
         Generated name as string
     """
-    try:
-        # Load the cropped image for better naming
-        cropped_img = Image.open(crop_path)
-        
-        # Prepare a prompt for Gemini to name this specific object
-        prompt = [
-            "Look at this image and provide a short descriptive name (1-2 words) that clearly identifies what this object is. "
-            "Return ONLY the name as plain text, with no additional text, quotes, or formatting.",
-            cropped_img  # the cropped image is provided to the model
-        ]
-        
-        # Configure the model
-        generation_config = genai.GenerationConfig(
-            temperature=0.2,  # Slightly higher temperature for more creative naming
-            top_p=0.95,
-        )
-        
-        # Use Gemini 2.0 Flash for faster processing
-        model = genai.GenerativeModel(model_name="gemini-2.0-flash")
-        response = model.generate_content(prompt, generation_config=generation_config)
-        
-        # Extract the text content from the response
-        if hasattr(response, 'text'):
-            content = response.text
-        elif hasattr(response, 'parts'):
-            content = ''.join([part.text for part in response.parts])
-        elif hasattr(response, 'content') and hasattr(response.content, 'parts'):
-            content = ''.join([part.get('text', '') for part in response.content.parts])
-        else:
-            content = str(response)
-        
-        # Clean up the response (remove quotes, newlines, etc.)
-        name = content.strip().strip('"\'').strip()
-        
-        # Convert the name to snake_case
-        name = to_snake_case(name)
-        
-        # Log the raw response for debugging if debug is enabled
-        if debug and debug_dir:
-            os.makedirs(debug_dir, exist_ok=True)
-            debug_response_path = os.path.join(debug_dir, f"{os.path.basename(crop_path)}_naming_response.txt")
-            with open(debug_response_path, 'w') as f:
-                f.write(f"Original: {content}\nSnake case: {name}")
-            logging.info(f"Saved naming response to {debug_response_path}")
-        
-        return name if name else None
+    # Maximum number of retries for rate limit errors
+    max_retries = 3
+    retry_count = 0
+    base_delay = 5  # Base delay in seconds
+    
+    while retry_count <= max_retries:
+        try:
+            # Load the cropped image for better naming
+            cropped_img = Image.open(crop_path)
             
-    except Exception as e:
-        logging.error(f"Error generating name for {crop_path}: {e}")
-        logging.debug(traceback.format_exc())
-        return None
+            # Prepare a prompt for Gemini to name this specific object
+            prompt = [
+                "Look at this image and provide a short descriptive name (1-2 words) that clearly identifies what this object is. "
+                "Return ONLY the name as plain text, with no additional text, quotes, or formatting.",
+                cropped_img  # the cropped image is provided to the model
+            ]
+            
+            # Configure the model
+            generation_config = genai.GenerationConfig(
+                temperature=0.2,  # Slightly higher temperature for more creative naming
+                top_p=0.95,
+            )
+            
+            # Use Gemini 2.0 Flash for faster processing
+            model = genai.GenerativeModel(model_name="gemini-2.0-flash")
+            response = model.generate_content(prompt, generation_config=generation_config)
+            
+            # Extract the text content from the response
+            if hasattr(response, 'text'):
+                content = response.text
+            elif hasattr(response, 'parts'):
+                content = ''.join([part.text for part in response.parts])
+            elif hasattr(response, 'content') and hasattr(response.content, 'parts'):
+                content = ''.join([part.get('text', '') for part in response.content.parts])
+            else:
+                content = str(response)
+            
+            # Clean up the response (remove quotes, newlines, etc.)
+            name = content.strip().strip('"\'').strip()
+            
+            # Convert the name to snake_case
+            name = to_snake_case(name)
+            
+            # Log the raw response for debugging if debug is enabled
+            if debug and debug_dir:
+                os.makedirs(debug_dir, exist_ok=True)
+                debug_response_path = os.path.join(debug_dir, f"{os.path.basename(crop_path)}_naming_response.txt")
+                with open(debug_response_path, 'w') as f:
+                    f.write(f"Original: {content}\nSnake case: {name}")
+                logging.info(f"Saved naming response to {debug_response_path}")
+            
+            return name if name else None
+                
+        except Exception as e:
+            error_message = str(e)
+            
+            # Check if this is a rate limit error (429)
+            if "429" in error_message and "Resource has been exhausted" in error_message:
+                retry_count += 1
+                if retry_count <= max_retries:
+                    # Calculate exponential backoff delay: base_delay * 2^retry_count
+                    delay = base_delay * (2 ** (retry_count - 1))
+                    logging.warning(f"Rate limit exceeded for {crop_path}. Retrying in {delay} seconds... (Attempt {retry_count}/{max_retries})")
+                    time.sleep(delay)
+                    continue
+                else:
+                    logging.error(f"Max retries reached for rate limit on {crop_path}. Using fallback name.")
+                    # Return a fallback name based on the filename
+                    base_name = os.path.basename(crop_path)
+                    fallback_name = os.path.splitext(base_name)[0]
+                    return fallback_name
+            else:
+                # For other errors, log and return None
+                logging.error(f"Error generating name for {crop_path}: {e}")
+                logging.debug(traceback.format_exc())
+                return None
 
 def generate_object_names(image_path, cropped_images, debug=False):
     """
@@ -380,7 +430,8 @@ def generate_object_names(image_path, cropped_images, debug=False):
         os.makedirs(debug_dir, exist_ok=True)
     
     # Use ThreadPoolExecutor for parallel processing of naming
-    max_workers = min(os.cpu_count() or 4, 4)  # Limit to 4 workers to avoid API rate limits
+    # Reduce workers to 2 to help prevent rate limiting
+    max_workers = 2  # Reduced from 4 to 2 to avoid API rate limits
     
     # Prepare a list of tasks for parallel execution
     tasks = []
@@ -1615,7 +1666,8 @@ def main(input_dir, output_dir=None, debug=False, force_watercolor=True, mode="a
     
     results = {}
     # Use ThreadPoolExecutor for parallel processing of images
-    max_workers = min(os.cpu_count() or 4, 4)  # Limit to 4 workers to avoid API rate limits
+    # Limit to 3 workers as per requirement
+    max_workers = 3  # Process only 3 images at a time
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Launch parallel tasks
         future_to_img = {
